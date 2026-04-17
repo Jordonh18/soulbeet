@@ -34,19 +34,21 @@ use tokio::sync::{RwLock, Semaphore};
 #[cfg(feature = "server")]
 const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
 #[cfg(feature = "server")]
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(feature = "server")]
 const SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Delay between spawning individual track tasks to spread out initial semaphore acquisition
 #[cfg(feature = "server")]
 const BATCH_DELAY: Duration = Duration::from_millis(100);
-/// Maximum concurrent searches against slskd. Downloads/monitors run freely beyond this.
+/// Maximum concurrent searches against slskd. Keep low — the Soulseek P2P network
+/// gets congested with too many parallel queries from the same client. Downloads
+/// run freely with no limit once queued.
 #[cfg(feature = "server")]
-const MAX_CONCURRENT_SEARCHES: usize = 8;
+const MAX_CONCURRENT_SEARCHES: usize = 4;
 /// Minimum gap between consecutive search API calls to avoid 429 rate limits from slskd.
 /// The semaphore limits how many searches are in-flight; this limits how fast new ones start.
 #[cfg(feature = "server")]
-const SEARCH_START_INTERVAL: Duration = Duration::from_millis(1500);
+const SEARCH_START_INTERVAL: Duration = Duration::from_millis(2000);
 /// Delay after a track's download monitor completes before querying Navidrome
 #[cfg(feature = "server")]
 const POST_IMPORT_SETTLE_DELAY: Duration = Duration::from_secs(5);
