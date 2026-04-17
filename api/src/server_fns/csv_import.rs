@@ -34,9 +34,12 @@ use tokio::sync::{RwLock, Semaphore};
 #[cfg(feature = "server")]
 const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
 #[cfg(feature = "server")]
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(feature = "server")]
 const SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Minimum search time before we'll accept early termination when good results are found
+#[cfg(feature = "server")]
+const MIN_SEARCH_TIME: Duration = Duration::from_secs(15);
 /// Delay between spawning individual track tasks to spread out initial semaphore acquisition
 #[cfg(feature = "server")]
 const BATCH_DELAY: Duration = Duration::from_millis(100);
@@ -575,29 +578,53 @@ impl CsvImportContext {
                         }
                     };
 
-                    let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
+                    let start = tokio::time::Instant::now();
+                    let deadline = start + SEARCH_TIMEOUT;
+                    // Accumulate best results from InProgress responses.
+                    // poll_search returns results with InProgress as peers respond,
+                    // but returns Completed with EMPTY results on internal timeout.
+                    // Without accumulation, all intermediate results are lost.
+                    let mut best_groups = Vec::<DownloadableGroup>::new();
                     loop {
                         if tokio::time::Instant::now() >= deadline {
-                            warn!("Backend {} search timed out", id);
+                            warn!("Backend {} search timed out ({} results accumulated)", id, best_groups.len());
                             break;
                         }
                         tokio::time::sleep(SEARCH_POLL_INTERVAL).await;
 
                         match backend.poll_search(&search_id).await {
-                            Ok(result) => match result.state {
-                                SearchState::Completed | SearchState::TimedOut => {
-                                    return (id, result.groups);
+                            Ok(result) => {
+                                let groups = result.groups;
+                                let state = result.state;
+                                // Each InProgress result with groups contains ALL
+                                // results so far (not incremental), so always replace
+                                if !groups.is_empty() {
+                                    best_groups = groups;
                                 }
-                                SearchState::NotFound => return (id, Vec::new()),
-                                SearchState::InProgress => continue,
-                            },
+                                match state {
+                                    SearchState::Completed | SearchState::TimedOut => {
+                                        return (id, best_groups);
+                                    }
+                                    SearchState::NotFound => return (id, best_groups),
+                                    SearchState::InProgress => {
+                                        // Early exit: if we have good results and
+                                        // enough time has passed, stop waiting
+                                        if !best_groups.is_empty()
+                                            && start.elapsed() >= MIN_SEARCH_TIME
+                                        {
+                                            return (id, best_groups);
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 warn!("Backend {} poll error: {}", id, e);
-                                return (id, Vec::new());
+                                return (id, best_groups);
                             }
                         }
                     }
-                    (id, Vec::new())
+                    (id, best_groups)
                 }
             })
             .collect();
