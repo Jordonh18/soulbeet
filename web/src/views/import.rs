@@ -27,8 +27,20 @@ pub fn ImportPage() -> Element {
     // from the parent scope (so the task survives PreviewSection unmounting).
     let import_trigger: Signal<Option<CsvBatchImportRequest>> = use_signal(|| None);
 
+    // Check for active import on mount (recovers state after page reload)
+    let import_status = use_resource(|| async { api::get_import_status().await });
+
     // Load user folders for the target folder picker
     let folders_resource = use_resource(|| async { api::get_user_folders().await });
+
+    // Recover active import state on page load
+    use_effect(move || {
+        if let Some(Ok(ref status)) = *import_status.read() {
+            if status.active && *state.read() == ImportState::Upload {
+                state.set(ImportState::Importing);
+            }
+        }
+    });
 
     // Watch import_trigger — run the import in the parent scope so the spawned
     // task is NOT cancelled when PreviewSection unmounts.
@@ -440,10 +452,10 @@ fn DoneSection(progress: CsvImportProgress, state: Signal<ImportState>) -> Eleme
                                                 span { class: "text-red-400", title: "{error}", "✗ Failed" }
                                             },
                                             CsvTrackStatus::Searching => rsx! {
-                                                span { class: "text-yellow-400", "⏳ Searching" }
+                                                span { class: "text-yellow-400", "Searching" }
                                             },
                                             CsvTrackStatus::Pending => rsx! {
-                                                span { class: "text-gray-500", "⏳ Pending" }
+                                                span { class: "text-gray-500", "Pending" }
                                             },
                                         }
                                     }

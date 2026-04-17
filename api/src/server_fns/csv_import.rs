@@ -56,6 +56,15 @@ const NAVIDROME_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// Minimum cooldown between triggering Navidrome library scans
 #[cfg(feature = "server")]
 const SCAN_COOLDOWN: Duration = Duration::from_secs(30);
+/// Maximum number of download source candidates to try per track before giving up.
+/// On queue failure, the next-best scored source is attempted automatically.
+#[cfg(feature = "server")]
+const MAX_DOWNLOAD_ATTEMPTS: usize = 3;
+
+/// Tracks active CSV imports per user so the UI can recover state after page reload.
+#[cfg(feature = "server")]
+static ACTIVE_IMPORTS: std::sync::LazyLock<std::sync::RwLock<HashMap<String, ActiveImportStatus>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
 /// A single track parsed from a TuneMyMusic CSV export.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -107,6 +116,15 @@ pub struct CsvImportProgress {
     /// Playlists that will be created after downloads complete
     pub playlists: Vec<String>,
     pub done: bool,
+}
+
+/// Whether a CSV import is currently running for a user.
+/// Returned by `get_import_status` so the UI can recover state on page reload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActiveImportStatus {
+    pub active: bool,
+    pub total_tracks: usize,
+    pub playlists: Vec<String>,
 }
 
 /// Parse a TuneMyMusic CSV on the server and return structured track data.
@@ -362,6 +380,38 @@ impl CsvImportContext {
         None
     }
 
+    /// Quick check if a song already exists in Navidrome (single search, no retries/scans).
+    /// Returns the song_id only if BOTH title AND artist match (strict to avoid false positives).
+    async fn check_song_exists(&self, track: &CsvTrackEntry) -> Option<String> {
+        let client = self.navidrome.as_ref()?;
+        let query = format!("{} {}", track.artist, track.track_name);
+        let title_lower = track.track_name.to_lowercase();
+        let artist_lower = track.artist.to_lowercase();
+
+        match client.search(&query).await {
+            Ok(results) => results
+                .song
+                .iter()
+                .find(|s| {
+                    let title_match = {
+                        let s_title = s.title.to_lowercase();
+                        s_title.contains(&title_lower) || title_lower.contains(&s_title)
+                    };
+                    let artist_match = s
+                        .artist
+                        .as_deref()
+                        .map(|a| {
+                            let a_lower = a.to_lowercase();
+                            a_lower.contains(&artist_lower) || artist_lower.contains(&a_lower)
+                        })
+                        .unwrap_or(false);
+                    title_match && artist_match
+                })
+                .map(|s| s.id.clone()),
+            Err(_) => None,
+        }
+    }
+
     /// Process a single CSV track through the full pipeline:
     /// ensure playlist → search → score → download → monitor → add to playlist.
     ///
@@ -386,6 +436,42 @@ impl CsvImportContext {
 
         // --- Phase 1: Ensure playlist exists (lightweight, no semaphore needed) ---
         let playlist_id = self.ensure_playlist(&track.playlist_name).await;
+
+        // --- Phase 1b: Check if song already exists in Navidrome ---
+        if let Some(song_id) = self.check_song_exists(track).await {
+            info!(
+                "CSV import [{}/{}]: '{}' already in Navidrome (id: {}), skipping download",
+                idx + 1,
+                self.total_tracks,
+                query_desc,
+                song_id
+            );
+            // Still add to the correct playlist if needed
+            if let Some(ref pl_id) = playlist_id {
+                if let Some(client) = self.navidrome.as_ref() {
+                    match client
+                        .update_playlist_songs(pl_id, &[song_id.clone()])
+                        .await
+                    {
+                        Ok(()) => info!(
+                            "Added existing '{}' to playlist '{}'",
+                            track.track_name, track.playlist_name
+                        ),
+                        Err(e) => warn!(
+                            "Failed to add existing '{}' to playlist '{}': {}",
+                            track.track_name, track.playlist_name, e
+                        ),
+                    }
+                }
+            }
+            info!(
+                "CSV import [{}/{}]: completed '{}' (already existed)",
+                idx + 1,
+                self.total_tracks,
+                query_desc
+            );
+            return;
+        }
 
         // --- Phase 2: Search + score + queue download (semaphore-gated) ---
         let permit = match self.search_semaphore.acquire().await {
@@ -544,29 +630,8 @@ impl CsvImportContext {
             return;
         }
 
-        let picked = all_groups.remove(0);
-
-        let _ = self.tx.send(DownloadEvent::AutoDownload(
-            AutoDownloadEvent::PickedSource {
-                batch_id: batch_id.clone(),
-                source: picked.source.clone(),
-                score: picked.score,
-                quality: picked.quality.clone(),
-                track_count: picked.items.len(),
-            },
-        ));
-
-        info!(
-            "CSV import [{}/{}]: picked '{}' (score {:.2}, {}) for '{}'",
-            idx + 1,
-            self.total_tracks,
-            picked.source,
-            picked.score,
-            picked.quality,
-            query_desc
-        );
-
-        // Create target directory
+        // --- Download phase: try top sources with retry on queue failure ---
+        // Create target directory once (shared by all retry attempts)
         if let Err(e) = tokio::fs::create_dir_all(&self.folder_path).await {
             let _ = self.tx.send(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
@@ -578,8 +643,6 @@ impl CsvImportContext {
             return;
         }
 
-        // Queue download
-        let items = picked.items.clone();
         let backend = match download_backend(None).await {
             Ok(b) => b,
             Err(e) => {
@@ -594,93 +657,158 @@ impl CsvImportContext {
             }
         };
 
-        let queued = match backend.download(items).await {
-            Ok(q) => q,
-            Err(e) => {
-                let _ = self.tx.send(DownloadEvent::AutoDownload(
-                    AutoDownloadEvent::Failed {
-                        batch_id: batch_id.clone(),
-                        error: format!("Download queue failed: {}", e),
-                    },
-                ));
-                drop(permit);
-                return;
-            }
-        };
-
-        // Release search semaphore — download is queued, next search can start
+        // Release search semaphore — search phase complete.
+        // Download retries happen freely without holding the semaphore.
         drop(permit);
 
+        let max_attempts = all_groups.len().min(MAX_DOWNLOAD_ATTEMPTS);
         let batch_label = format!("{} - {}", track.artist, track.track_name);
-        let (failed, successful): (Vec<_>, Vec<_>) =
-            queued.iter().cloned().partition(|d| d.error.is_some());
+        let mut download_succeeded = false;
 
-        if !failed.is_empty() {
-            let failed_entries: Vec<DownloadProgress> = failed
+        for attempt in 0..max_attempts {
+            if self.cancellation_token.is_cancelled() {
+                break;
+            }
+
+            let candidate = &all_groups[attempt];
+
+            if attempt > 0 {
+                info!(
+                    "CSV import [{}/{}]: retry {}/{} for '{}' — trying source '{}' (score {:.2})",
+                    idx + 1,
+                    self.total_tracks,
+                    attempt + 1,
+                    max_attempts,
+                    query_desc,
+                    candidate.source,
+                    candidate.score
+                );
+            }
+
+            let _ = self.tx.send(DownloadEvent::AutoDownload(
+                AutoDownloadEvent::PickedSource {
+                    batch_id: batch_id.clone(),
+                    source: candidate.source.clone(),
+                    score: candidate.score,
+                    quality: candidate.quality.clone(),
+                    track_count: candidate.items.len(),
+                },
+            ));
+
+            info!(
+                "CSV import [{}/{}]: picked '{}' (score {:.2}, {}) for '{}'{}",
+                idx + 1,
+                self.total_tracks,
+                candidate.source,
+                candidate.score,
+                candidate.quality,
+                query_desc,
+                if attempt > 0 { " [retry]" } else { "" }
+            );
+
+            // Queue download
+            let queued = match backend.download(candidate.items.clone()).await {
+                Ok(q) => q,
+                Err(e) => {
+                    warn!(
+                        "CSV import: queue error on attempt {}/{} for '{}': {}",
+                        attempt + 1,
+                        max_attempts,
+                        query_desc,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let (failed, successful): (Vec<_>, Vec<_>) =
+                queued.iter().cloned().partition(|d| d.error.is_some());
+
+            if !failed.is_empty() {
+                let failed_entries: Vec<DownloadProgress> = failed
+                    .iter()
+                    .map(|d| {
+                        DownloadProgress::failed(
+                            d.id.clone(),
+                            d.source.clone(),
+                            d.item.clone(),
+                            d.error.clone().unwrap_or_default(),
+                        )
+                        .with_batch(batch_id.clone(), batch_label.clone())
+                    })
+                    .collect();
+                let _ = self.tx.send(DownloadEvent::Progress(failed_entries));
+            }
+
+            if successful.is_empty() {
+                warn!(
+                    "CSV import: all items failed to queue on attempt {}/{} for '{}'",
+                    attempt + 1,
+                    max_attempts,
+                    query_desc
+                );
+                continue;
+            }
+
+            // Queue succeeded — proceed with monitoring
+            download_succeeded = true;
+
+            let _ = self.tx.send(DownloadEvent::AutoDownload(
+                AutoDownloadEvent::Downloading {
+                    batch_id: batch_id.clone(),
+                },
+            ));
+
+            let queued_entries: Vec<DownloadProgress> = successful
                 .iter()
                 .map(|d| {
-                    DownloadProgress::failed(
+                    DownloadProgress::queued(
                         d.id.clone(),
                         d.source.clone(),
                         d.item.clone(),
-                        d.error.clone().unwrap_or_default(),
+                        d.size,
                     )
                     .with_batch(batch_id.clone(), batch_label.clone())
                 })
                 .collect();
-            let _ = self.tx.send(DownloadEvent::Progress(failed_entries));
+            let _ = self.tx.send(DownloadEvent::Progress(queued_entries));
+
+            let download_sources: Vec<String> =
+                successful.iter().map(|d| d.source.clone()).collect();
+            let download_filenames: Vec<String> =
+                successful.iter().map(|d| d.item.clone()).collect();
+
+            // --- Phase 3: Monitor download ---
+            let task_cancellation = register_user_task(&self.username).await;
+
+            let mut monitor = DownloadMonitor::new(
+                download_sources,
+                download_filenames,
+                self.folder_path.clone(),
+                self.tx.clone(),
+                task_cancellation,
+                self.username.clone(),
+                Some(batch_id.clone()),
+                Some(batch_label.clone()),
+            );
+            monitor.run().await;
+            unregister_user_task(&self.username).await;
+
+            break;
         }
 
-        if successful.is_empty() {
+        if !download_succeeded {
             let _ = self.tx.send(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
-                    error: "All downloads failed to queue".to_string(),
+                    error: format!(
+                        "All {} download attempts failed for '{}'",
+                        max_attempts, query_desc
+                    ),
                 },
             ));
             return;
         }
-
-        let _ = self.tx.send(DownloadEvent::AutoDownload(
-            AutoDownloadEvent::Downloading {
-                batch_id: batch_id.clone(),
-            },
-        ));
-
-        let queued_entries: Vec<DownloadProgress> = successful
-            .iter()
-            .map(|d| {
-                DownloadProgress::queued(
-                    d.id.clone(),
-                    d.source.clone(),
-                    d.item.clone(),
-                    d.size,
-                )
-                .with_batch(batch_id.clone(), batch_label.clone())
-            })
-            .collect();
-        let _ = self.tx.send(DownloadEvent::Progress(queued_entries));
-
-        let download_sources: Vec<String> =
-            successful.iter().map(|d| d.source.clone()).collect();
-        let download_filenames: Vec<String> =
-            successful.iter().map(|d| d.item.clone()).collect();
-
-        // --- Phase 3: Monitor download (runs without semaphore) ---
-        let task_cancellation = register_user_task(&self.username).await;
-
-        let mut monitor = DownloadMonitor::new(
-            download_sources,
-            download_filenames,
-            self.folder_path.clone(),
-            self.tx.clone(),
-            task_cancellation,
-            self.username.clone(),
-            Some(batch_id.clone()),
-            Some(batch_label),
-        );
-        monitor.run().await;
-        unregister_user_task(&self.username).await;
 
         // --- Phase 4: Add to playlist after download + beets import ---
         if let Some(ref pl_id) = playlist_id {
@@ -827,7 +955,21 @@ pub async fn import_csv_batch(
 
     // Spawn the batch coordinator — manages all per-track tasks
     let batch_username = username.clone();
+    let playlist_names_for_status = playlist_names.clone();
     tokio::spawn(async move {
+        // Register active import so UI can recover state on page reload
+        {
+            let mut imports = ACTIVE_IMPORTS.write().unwrap();
+            imports.insert(
+                batch_username.clone(),
+                ActiveImportStatus {
+                    active: true,
+                    total_tracks: total,
+                    playlists: playlist_names_for_status,
+                },
+            );
+        }
+
         let mut handles = Vec::with_capacity(tracks.len());
 
         for (idx, track) in tracks.iter().enumerate() {
@@ -866,6 +1008,12 @@ pub async fn import_csv_batch(
 
         unregister_user_task(&batch_username).await;
 
+        // Unregister active import
+        {
+            let mut imports = ACTIVE_IMPORTS.write().unwrap();
+            imports.remove(&batch_username);
+        }
+
         info!(
             "CSV import batch fully complete for user {}: all {} tracks processed",
             batch_username, total
@@ -882,6 +1030,24 @@ pub async fn import_csv_batch(
         playlists: playlist_names,
         done: false,
     })
+}
+
+/// Check if a CSV import is currently running for the authenticated user.
+/// Used by the UI to recover import state after page reload.
+#[get("/api/csv/import/status", auth: AuthSession)]
+pub async fn get_import_status() -> Result<ActiveImportStatus, ServerFnError> {
+    let username = auth.0.username.clone();
+    let imports = ACTIVE_IMPORTS
+        .read()
+        .map_err(|e| super::server_error(&format!("Lock poisoned: {}", e)))?;
+    match imports.get(&username) {
+        Some(status) => Ok(status.clone()),
+        None => Ok(ActiveImportStatus {
+            active: false,
+            total_tracks: 0,
+            playlists: Vec::new(),
+        }),
+    }
 }
 
 /// Parse a single CSV line, handling quoted fields properly.
