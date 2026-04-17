@@ -12,7 +12,7 @@ use dioxus::fullstack::WebSocketOptions;
 use websocket::use_resilient_websocket;
 
 use ui::{AutoDownloadSignal, Downloads, Layout, Navbar, SearchPrefill, SearchReset, SettingsProvider};
-use views::{DashboardPage, LoginPage, SearchPage, SettingsPage};
+use views::{DashboardPage, ImportPage, LoginPage, SearchPage, SettingsPage};
 
 mod auth;
 mod views;
@@ -31,6 +31,8 @@ pub enum Route {
             SearchPage {},
             #[route("/dashboard")]
             DashboardPage {},
+            #[route("/import")]
+            ImportPage {},
             #[route("/settings")]
             SettingsPage {},
 }
@@ -173,6 +175,24 @@ fn WebNavbar() -> Element {
                             stroke_linecap: "round",
                             stroke_linejoin: "round",
                             d: "M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z",
+                        }
+                    }
+                }
+                Link {
+                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent pb-0.5",
+                    active_class: "border-beet-accent",
+                    to: Route::ImportPage {},
+                    span { class: "hidden md:block", "Import" }
+                    svg {
+                        class: "md:hidden w-6 h-6",
+                        fill: "none",
+                        stroke: "currentColor",
+                        view_box: "0 0 24 24",
+                        stroke_width: "1.5",
+                        path {
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            d: "M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5",
                         }
                     }
                 }
