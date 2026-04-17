@@ -34,17 +34,19 @@ use tokio::sync::{RwLock, Semaphore};
 #[cfg(feature = "server")]
 const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
 #[cfg(feature = "server")]
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(feature = "server")]
 const SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Delay between spawning individual track tasks to spread out initial semaphore acquisition
 #[cfg(feature = "server")]
 const BATCH_DELAY: Duration = Duration::from_millis(100);
 /// Maximum concurrent searches against slskd. Downloads/monitors run freely beyond this.
-/// 10 concurrent searches is well within slskd's capability while keeping the Soulseek
-/// network load reasonable.
 #[cfg(feature = "server")]
-const MAX_CONCURRENT_SEARCHES: usize = 10;
+const MAX_CONCURRENT_SEARCHES: usize = 8;
+/// Minimum gap between consecutive search API calls to avoid 429 rate limits from slskd.
+/// The semaphore limits how many searches are in-flight; this limits how fast new ones start.
+#[cfg(feature = "server")]
+const SEARCH_START_INTERVAL: Duration = Duration::from_millis(1500);
 /// Delay after a track's download monitor completes before querying Navidrome
 #[cfg(feature = "server")]
 const POST_IMPORT_SETTLE_DELAY: Duration = Duration::from_secs(5);
@@ -218,6 +220,8 @@ struct CsvImportContext {
     playlist_cache: RwLock<HashMap<String, String>>,
     /// Limits concurrent searches against slskd to avoid flooding.
     search_semaphore: Semaphore,
+    /// Rate limiter: ensures minimum gap between consecutive search API calls to avoid 429s.
+    last_search_start: tokio::sync::Mutex<Option<tokio::time::Instant>>,
     /// Tracks last scan trigger time to avoid spamming Navidrome with scan requests.
     last_scan: tokio::sync::Mutex<Option<tokio::time::Instant>>,
     total_tracks: usize,
@@ -493,6 +497,19 @@ impl CsvImportContext {
         if self.cancellation_token.is_cancelled() {
             drop(permit);
             return;
+        }
+
+        // Rate-limit search API calls to avoid 429s from slskd.
+        // The semaphore limits concurrency; this limits the rate of new search starts.
+        {
+            let mut last = self.last_search_start.lock().await;
+            if let Some(last_time) = *last {
+                let elapsed = last_time.elapsed();
+                if elapsed < SEARCH_START_INTERVAL {
+                    tokio::time::sleep(SEARCH_START_INTERVAL - elapsed).await;
+                }
+            }
+            *last = Some(tokio::time::Instant::now());
         }
 
         let _ = self
@@ -975,6 +992,7 @@ pub async fn import_csv_batch(
         navidrome,
         playlist_cache: RwLock::new(initial_cache),
         search_semaphore: Semaphore::new(MAX_CONCURRENT_SEARCHES),
+        last_search_start: tokio::sync::Mutex::new(None),
         last_scan: tokio::sync::Mutex::new(None),
         total_tracks: total,
     });
