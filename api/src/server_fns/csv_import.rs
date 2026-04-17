@@ -381,7 +381,8 @@ impl CsvImportContext {
     }
 
     /// Quick check if a song already exists in Navidrome (single search, no retries/scans).
-    /// Returns the song_id only if BOTH title AND artist match (strict to avoid false positives).
+    /// Uses STRICT exact case-insensitive equality on both title AND artist to avoid
+    /// false positives that would incorrectly skip downloads.
     async fn check_song_exists(&self, track: &CsvTrackEntry) -> Option<String> {
         let client = self.navidrome.as_ref()?;
         let query = format!("{} {}", track.artist, track.track_name);
@@ -393,17 +394,23 @@ impl CsvImportContext {
                 .song
                 .iter()
                 .find(|s| {
-                    let title_match = {
-                        let s_title = s.title.to_lowercase();
-                        s_title.contains(&title_lower) || title_lower.contains(&s_title)
+                    let s_title = s.title.to_lowercase();
+                    // Exact title match, or starts-with for "Song - Remastered" variants
+                    // (only if the CSV title is a substantial prefix — at least 80% of the length)
+                    let title_match = s_title == title_lower || {
+                        let (shorter, longer) = if s_title.len() <= title_lower.len() {
+                            (&s_title, &title_lower)
+                        } else {
+                            (&title_lower, &s_title)
+                        };
+                        shorter.len() >= 5
+                            && (shorter.len() as f64 / longer.len().max(1) as f64) > 0.8
+                            && longer.starts_with(shorter.as_str())
                     };
                     let artist_match = s
                         .artist
                         .as_deref()
-                        .map(|a| {
-                            let a_lower = a.to_lowercase();
-                            a_lower.contains(&artist_lower) || artist_lower.contains(&a_lower)
-                        })
+                        .map(|a| a.to_lowercase() == artist_lower)
                         .unwrap_or(false);
                     title_match && artist_match
                 })
@@ -663,7 +670,8 @@ impl CsvImportContext {
 
         let max_attempts = all_groups.len().min(MAX_DOWNLOAD_ATTEMPTS);
         let batch_label = format!("{} - {}", track.artist, track.track_name);
-        let mut download_succeeded = false;
+        let mut found_song_id: Option<String> = None;
+        let mut any_monitor_ran = false;
 
         for attempt in 0..max_attempts {
             if self.cancellation_token.is_cancelled() {
@@ -750,9 +758,7 @@ impl CsvImportContext {
                 continue;
             }
 
-            // Queue succeeded — proceed with monitoring
-            download_succeeded = true;
-
+            // Queue succeeded — send progress events and monitor
             let _ = self.tx.send(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Downloading {
                     batch_id: batch_id.clone(),
@@ -778,7 +784,7 @@ impl CsvImportContext {
             let download_filenames: Vec<String> =
                 successful.iter().map(|d| d.item.clone()).collect();
 
-            // --- Phase 3: Monitor download ---
+            // --- Monitor download until complete ---
             let task_cancellation = register_user_task(&self.username).await;
 
             let mut monitor = DownloadMonitor::new(
@@ -793,11 +799,33 @@ impl CsvImportContext {
             );
             monitor.run().await;
             unregister_user_task(&self.username).await;
+            any_monitor_ran = true;
 
-            break;
+            // Verify download actually produced a result in Navidrome.
+            // Give beets import + Navidrome indexing time to settle (double the
+            // normal delay since we'll retry with the next source if this fails).
+            tokio::time::sleep(POST_IMPORT_SETTLE_DELAY * 2).await;
+            found_song_id = self.check_song_exists(track).await;
+            if found_song_id.is_some() {
+                break; // Confirmed in Navidrome — success!
+            }
+
+            // Download was queued and monitored but song not found — transfer likely failed
+            if attempt + 1 < max_attempts {
+                warn!(
+                    "CSV import: attempt {}/{} for '{}' completed but song not found in Navidrome, trying next source",
+                    attempt + 1, max_attempts, query_desc
+                );
+            }
         }
 
-        if !download_succeeded {
+        // If quick check didn't find it but a monitor ran, try heavier lookup
+        // with retries + scan trigger (handles slow beets import / Navidrome indexing)
+        if found_song_id.is_none() && any_monitor_ran {
+            found_song_id = self.find_song_in_navidrome(track).await;
+        }
+
+        if found_song_id.is_none() {
             let _ = self.tx.send(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
@@ -810,16 +838,13 @@ impl CsvImportContext {
             return;
         }
 
-        // --- Phase 4: Add to playlist after download + beets import ---
+        // --- Phase 4: Add to playlist ---
         if let Some(ref pl_id) = playlist_id {
             if self.cancellation_token.is_cancelled() {
                 return;
             }
 
-            // Give beets import + Navidrome indexing time to settle
-            tokio::time::sleep(POST_IMPORT_SETTLE_DELAY).await;
-
-            if let Some(song_id) = self.find_song_in_navidrome(track).await {
+            if let Some(ref song_id) = found_song_id {
                 if let Some(client) = self.navidrome.as_ref() {
                     match client
                         .update_playlist_songs(pl_id, &[song_id.clone()])
