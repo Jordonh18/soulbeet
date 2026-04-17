@@ -234,6 +234,15 @@ struct CsvImportContext {
 
 #[cfg(feature = "server")]
 impl CsvImportContext {
+    /// Send a download event, logging if delivery fails while receivers are connected.
+    fn send_event(&self, event: DownloadEvent) {
+        if let Err(e) = self.tx.send(event) {
+            if self.tx.receiver_count() > 0 {
+                warn!("Failed to send download event ({} receivers): {}", self.tx.receiver_count(), e);
+            }
+        }
+    }
+
     /// Ensure a playlist exists in Navidrome, creating it if needed.
     /// Returns the playlist_id, or None if Navidrome is unavailable or creation fails.
     /// Uses a double-checked locking pattern to avoid redundant API calls.
@@ -517,9 +526,7 @@ impl CsvImportContext {
             *last = Some(tokio::time::Instant::now());
         }
 
-        let _ = self
-            .tx
-            .send(DownloadEvent::AutoDownload(AutoDownloadEvent::Searching {
+        self.send_event(DownloadEvent::AutoDownload(AutoDownloadEvent::Searching {
                 batch_id: batch_id.clone(),
                 query: query_desc.clone(),
                 backend_count: self.backend_ids.len(),
@@ -535,7 +542,7 @@ impl CsvImportContext {
         }
 
         if backends.is_empty() {
-            let _ = self.tx.send(DownloadEvent::AutoDownload(
+            self.send_event(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
                     error: "No download backends available".to_string(),
@@ -638,10 +645,10 @@ impl CsvImportContext {
             .collect();
 
         if all_groups.is_empty() {
-            let _ = self.tx.send(DownloadEvent::AutoDownload(
+            self.send_event(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
-                    error: "No results found".to_string(),
+                    error: format!("No search results for '{}'", query_desc),
                 },
             ));
             warn!("CSV import: no results for '{}'", query_desc);
@@ -657,7 +664,7 @@ impl CsvImportContext {
 
         let best_score = all_groups[0].score;
 
-        let _ = self.tx.send(DownloadEvent::AutoDownload(
+        self.send_event(DownloadEvent::AutoDownload(
             AutoDownloadEvent::ScoringResults {
                 batch_id: batch_id.clone(),
                 result_count: all_groups.len(),
@@ -667,7 +674,7 @@ impl CsvImportContext {
 
         // Lower threshold for CSV import — user explicitly requested these tracks
         if best_score < AUTO_SELECT_SCORE_THRESHOLD * 0.7 {
-            let _ = self.tx.send(DownloadEvent::AutoDownload(
+            self.send_event(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
                     error: format!(
@@ -687,7 +694,7 @@ impl CsvImportContext {
         // --- Download phase: try top sources with retry on queue failure ---
         // Create target directory once (shared by all retry attempts)
         if let Err(e) = tokio::fs::create_dir_all(&self.folder_path).await {
-            let _ = self.tx.send(DownloadEvent::AutoDownload(
+            self.send_event(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
                     error: format!("Failed to create target directory: {}", e),
@@ -700,7 +707,7 @@ impl CsvImportContext {
         let backend = match download_backend(None).await {
             Ok(b) => b,
             Err(e) => {
-                let _ = self.tx.send(DownloadEvent::AutoDownload(
+                self.send_event(DownloadEvent::AutoDownload(
                     AutoDownloadEvent::Failed {
                         batch_id: batch_id.clone(),
                         error: format!("Download backend not available: {}", e),
@@ -740,7 +747,7 @@ impl CsvImportContext {
                 );
             }
 
-            let _ = self.tx.send(DownloadEvent::AutoDownload(
+            self.send_event(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::PickedSource {
                     batch_id: batch_id.clone(),
                     source: candidate.source.clone(),
@@ -792,7 +799,7 @@ impl CsvImportContext {
                         .with_batch(batch_id.clone(), batch_label.clone())
                     })
                     .collect();
-                let _ = self.tx.send(DownloadEvent::Progress(failed_entries));
+                self.send_event(DownloadEvent::Progress(failed_entries));
             }
 
             if successful.is_empty() {
@@ -806,7 +813,7 @@ impl CsvImportContext {
             }
 
             // Queue succeeded — send progress events and monitor
-            let _ = self.tx.send(DownloadEvent::AutoDownload(
+            self.send_event(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Downloading {
                     batch_id: batch_id.clone(),
                 },
@@ -824,7 +831,7 @@ impl CsvImportContext {
                     .with_batch(batch_id.clone(), batch_label.clone())
                 })
                 .collect();
-            let _ = self.tx.send(DownloadEvent::Progress(queued_entries));
+            self.send_event(DownloadEvent::Progress(queued_entries));
 
             let download_sources: Vec<String> =
                 successful.iter().map(|d| d.source.clone()).collect();
@@ -873,13 +880,18 @@ impl CsvImportContext {
         }
 
         if found_song_id.is_none() {
-            let _ = self.tx.send(DownloadEvent::AutoDownload(
+            let detail = if !any_monitor_ran {
+                format!("Download queue failed for '{}' ({} sources tried)", query_desc, max_attempts)
+            } else {
+                format!(
+                    "Downloaded but not found in Navidrome for '{}' ({} sources tried, beets import may have failed)",
+                    query_desc, max_attempts
+                )
+            };
+            self.send_event(DownloadEvent::AutoDownload(
                 AutoDownloadEvent::Failed {
                     batch_id: batch_id.clone(),
-                    error: format!(
-                        "All {} download attempts failed for '{}'",
-                        max_attempts, query_desc
-                    ),
+                    error: detail,
                 },
             ));
             return;

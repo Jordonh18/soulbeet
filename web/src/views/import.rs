@@ -401,6 +401,43 @@ fn PreviewSection(
 
 #[component]
 fn DoneSection(progress: CsvImportProgress, state: Signal<ImportState>) -> Element {
+    let mut show_all = use_signal(|| false);
+
+    // Compute counts from statuses
+    let queued_count = progress
+        .statuses
+        .iter()
+        .filter(|(_, s)| matches!(s, CsvTrackStatus::Accepted { .. }))
+        .count();
+    let failed_count = progress
+        .statuses
+        .iter()
+        .filter(|(_, s)| matches!(s, CsvTrackStatus::Failed { .. }))
+        .count();
+    let pending_count = progress
+        .statuses
+        .iter()
+        .filter(|(_, s)| {
+            matches!(
+                s,
+                CsvTrackStatus::Pending | CsvTrackStatus::Searching
+            )
+        })
+        .count();
+
+    // Collect failed tracks for detail display (show error reason)
+    let failed_tracks: Vec<_> = progress
+        .statuses
+        .iter()
+        .filter_map(|(track, status)| {
+            if let CsvTrackStatus::Failed { error } = status {
+                Some((track.clone(), error.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     rsx! {
         div { class: "bg-beet-panel border border-white/10 rounded-lg p-6 space-y-4",
             div { class: "text-center space-y-2",
@@ -417,48 +454,52 @@ fn DoneSection(progress: CsvImportProgress, state: Signal<ImportState>) -> Eleme
                             }
                         }
                     }
-                    p { class: "text-gray-500 font-mono text-xs mt-1",
-                        "Playlists will be created in Navidrome automatically after downloads finish"
-                    }
                 }
                 p { class: "text-gray-500 font-mono text-xs",
                     "Track progress in the Downloads panel →"
                 }
             }
 
-            // Results breakdown
-            if !progress.statuses.is_empty() {
-                div { class: "overflow-x-auto max-h-[50vh] overflow-y-auto mt-4",
-                    table { class: "w-full text-sm font-mono",
-                        thead { class: "sticky top-0 bg-beet-panel",
-                            tr { class: "text-gray-500 uppercase text-xs tracking-wider border-b border-white/10",
-                                th { class: "text-left py-2 px-3", "Track" }
-                                th { class: "text-left py-2 px-3", "Artist" }
-                                th { class: "text-left py-2 px-3", "Status" }
+            // Summary counters instead of full table
+            div { class: "grid grid-cols-3 gap-4 mt-4",
+                div { class: "bg-green-500/10 border border-green-500/20 rounded-lg p-4 text-center",
+                    p { class: "text-2xl font-bold text-green-400 font-mono", "{queued_count}" }
+                    p { class: "text-gray-400 text-xs font-mono", "Queued" }
+                }
+                div { class: "bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4 text-center",
+                    p { class: "text-2xl font-bold text-yellow-400 font-mono", "{pending_count}" }
+                    p { class: "text-gray-400 text-xs font-mono", "Pending" }
+                }
+                div { class: "bg-red-500/10 border border-red-500/20 rounded-lg p-4 text-center",
+                    p { class: "text-2xl font-bold text-red-400 font-mono", "{failed_count}" }
+                    p { class: "text-gray-400 text-xs font-mono", "Failed" }
+                }
+            }
+
+            // Show failed tracks with actual error reasons (not hidden behind tooltip)
+            if !failed_tracks.is_empty() {
+                div { class: "mt-4",
+                    button {
+                        class: "w-full text-left px-4 py-2 bg-red-500/10 hover:bg-red-500/15 border border-red-500/20 rounded-lg transition-colors cursor-pointer",
+                        onclick: move |_| show_all.set(!show_all()),
+                        div { class: "flex items-center justify-between",
+                            span { class: "text-red-400 font-mono text-sm font-bold",
+                                "{failed_count} failed tracks"
+                            }
+                            span { class: "text-gray-500 text-xs font-mono",
+                                if show_all() { "▲ Hide" } else { "▼ Show details" }
                             }
                         }
-                        tbody {
-                            for (track, status) in progress.statuses.iter() {
-                                tr { class: "border-b border-white/5",
+                    }
+                    if show_all() {
+                        div { class: "mt-2 overflow-y-auto max-h-[40vh] space-y-1",
+                            for (track, error) in failed_tracks.iter() {
+                                div { class: "flex items-start gap-2 px-3 py-2 bg-red-500/5 rounded text-xs font-mono",
                                     key: "{track.row_index}",
-                                    td { class: "py-2 px-3 text-white", "{track.track_name}" }
-                                    td { class: "py-2 px-3 text-gray-300", "{track.artist}" }
-                                    td { class: "py-2 px-3",
-                                        match status {
-                                            CsvTrackStatus::Accepted { .. } => rsx! {
-                                                span { class: "text-green-400", "✓ Queued" }
-                                            },
-                                            CsvTrackStatus::Failed { error } => rsx! {
-                                                span { class: "text-red-400", title: "{error}", "✗ Failed" }
-                                            },
-                                            CsvTrackStatus::Searching => rsx! {
-                                                span { class: "text-yellow-400", "Searching" }
-                                            },
-                                            CsvTrackStatus::Pending => rsx! {
-                                                span { class: "text-gray-500", "Pending" }
-                                            },
-                                        }
+                                    span { class: "text-white whitespace-nowrap min-w-0 shrink-0",
+                                        "{track.artist} - {track.track_name}"
                                     }
+                                    span { class: "text-red-400/80 truncate", "{error}" }
                                 }
                             }
                         }

@@ -35,7 +35,7 @@ pub struct UserChannel {
 #[cfg(feature = "server")]
 impl UserChannel {
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(100);
+        let (sender, _) = broadcast::channel(1024);
         Self {
             sender,
             cancellation_token: CancellationToken::new(),

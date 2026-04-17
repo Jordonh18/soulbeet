@@ -357,13 +357,14 @@ impl DownloadMonitor {
                         "Track completed, processing immediately (singleton mode): {}",
                         download.item
                     );
-                    self.track_states.get_mut(&key).unwrap().processed = true;
                     let dl = download.clone();
                     let tp = self.target_path.clone();
                     let tx_clone = self.tx.clone();
-                    tokio::spawn(async move {
-                        process_downloads(vec![dl], tp, tx_clone).await;
-                    });
+                    // Await processing so we know the import result before
+                    // marking as processed.  Previous fire-and-forget caused
+                    // downloads to appear successful then flip to failed.
+                    process_downloads(vec![dl], tp, tx_clone).await;
+                    self.track_states.get_mut(&key).unwrap().processed = true;
                 }
 
                 // Mark terminal states (errored/cancelled/aborted) as processed
