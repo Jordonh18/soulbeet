@@ -326,6 +326,20 @@ fn PreviewSection(
                 }
             }
 
+            if !parse_result.playlists.is_empty() {
+                div { class: "flex items-center gap-2 flex-wrap",
+                    span { class: "text-gray-400 text-xs font-mono", "Playlists:" }
+                    for pl in parse_result.playlists.iter() {
+                        span { class: "px-2 py-0.5 bg-purple-500/20 text-purple-300 text-xs font-mono rounded",
+                            "{pl}"
+                        }
+                    }
+                    p { class: "text-gray-500 text-xs font-mono w-full mt-1",
+                        "These playlists will be auto-created in Navidrome after downloads complete"
+                    }
+                }
+            }
+
             // Track table
             div { class: "overflow-x-auto max-h-[60vh] overflow-y-auto",
                 table { class: "w-full text-sm font-mono",
@@ -335,6 +349,9 @@ fn PreviewSection(
                             th { class: "text-left py-2 px-3", "Track" }
                             th { class: "text-left py-2 px-3", "Artist" }
                             th { class: "text-left py-2 px-3", "Album" }
+                            if !parse_result.playlists.is_empty() {
+                                th { class: "text-left py-2 px-3", "Playlist" }
+                            }
                         }
                     }
                     tbody {
@@ -345,6 +362,9 @@ fn PreviewSection(
                                 td { class: "py-2 px-3 text-white", "{track.track_name}" }
                                 td { class: "py-2 px-3 text-gray-300", "{track.artist}" }
                                 td { class: "py-2 px-3 text-gray-500", "{track.album}" }
+                                if !parse_result.playlists.is_empty() {
+                                    td { class: "py-2 px-3 text-purple-300/80", "{track.playlist_name}" }
+                                }
                             }
                         }
                     }
@@ -362,6 +382,19 @@ fn DoneSection(progress: CsvImportProgress, state: Signal<ImportState>) -> Eleme
                 h2 { class: "text-2xl font-bold text-beet-accent font-display", "Import Started" }
                 p { class: "text-gray-300 font-mono text-sm",
                     "{progress.total} tracks queued for search & download"
+                }
+                if !progress.playlists.is_empty() {
+                    div { class: "mt-2 flex items-center justify-center gap-2 flex-wrap",
+                        span { class: "text-gray-400 text-sm font-mono", "Playlists to create:" }
+                        for pl in progress.playlists.iter() {
+                            span { class: "px-2 py-0.5 bg-purple-500/20 text-purple-300 text-xs font-mono rounded",
+                                "{pl}"
+                            }
+                        }
+                    }
+                    p { class: "text-gray-500 font-mono text-xs mt-1",
+                        "Playlists will be created in Navidrome automatically after downloads finish"
+                    }
                 }
                 p { class: "text-gray-500 font-mono text-xs",
                     "Track progress in the Downloads panel →"

@@ -16,7 +16,7 @@ use std::time::Duration;
 #[cfg(feature = "server")]
 use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
 #[cfg(feature = "server")]
-use crate::services::{available_download_backends, download_backend};
+use crate::services::{available_download_backends, download_backend, navidrome_client_for_user};
 #[cfg(feature = "server")]
 use crate::AuthSession;
 
@@ -40,6 +40,8 @@ pub struct CsvTrackEntry {
     pub track_name: String,
     pub artist: String,
     pub album: String,
+    /// Playlist name from column 4 (may be empty if not present)
+    pub playlist_name: String,
     /// Row index from the original CSV (for UI display)
     pub row_index: usize,
 }
@@ -48,6 +50,8 @@ pub struct CsvTrackEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CsvParseResult {
     pub tracks: Vec<CsvTrackEntry>,
+    /// Unique playlist names found in the CSV
+    pub playlists: Vec<String>,
     pub total_rows: usize,
     pub skipped_rows: usize,
 }
@@ -77,6 +81,8 @@ pub struct CsvImportProgress {
     pub failed: usize,
     pub current_track: Option<CsvTrackEntry>,
     pub statuses: Vec<(CsvTrackEntry, CsvTrackStatus)>,
+    /// Playlists that will be created after downloads complete
+    pub playlists: Vec<String>,
     pub done: bool,
 }
 
@@ -110,6 +116,7 @@ pub async fn parse_csv(csv_content: String) -> Result<CsvParseResult, ServerFnEr
         let track_name = fields[0].trim().to_string();
         let artist = fields[1].trim().to_string();
         let album = fields[2].trim().to_string();
+        let playlist_name = fields.get(3).map(|s| s.trim().to_string()).unwrap_or_default();
 
         if track_name.is_empty() || artist.is_empty() {
             skipped += 1;
@@ -120,21 +127,33 @@ pub async fn parse_csv(csv_content: String) -> Result<CsvParseResult, ServerFnEr
             track_name,
             artist,
             album,
+            playlist_name,
             row_index: i,
         });
     }
 
     let total_rows = lines.len().saturating_sub(start_idx);
 
+    // Collect unique playlist names (preserving order of first appearance)
+    let mut playlists: Vec<String> = Vec::new();
+    let mut seen_playlists = std::collections::HashSet::new();
+    for t in &tracks {
+        if !t.playlist_name.is_empty() && seen_playlists.insert(t.playlist_name.clone()) {
+            playlists.push(t.playlist_name.clone());
+        }
+    }
+
     info!(
-        "CSV parsed: {} tracks extracted, {} rows skipped out of {} data rows",
+        "CSV parsed: {} tracks extracted, {} rows skipped out of {} data rows, {} playlists found",
         tracks.len(),
         skipped,
-        total_rows
+        total_rows,
+        playlists.len()
     );
 
     Ok(CsvParseResult {
         tracks,
+        playlists,
         total_rows,
         skipped_rows: skipped,
     })
@@ -168,6 +187,19 @@ pub async fn import_csv_batch(
     let folder_path = req.folder_path.clone();
     let tracks = req.tracks.clone();
     let task_username = username.clone();
+    let user_id = auth.0.sub.clone();
+
+    // Collect unique playlist names from the batch
+    let playlist_names: Vec<String> = {
+        let mut names = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for t in &req.tracks {
+            if !t.playlist_name.is_empty() && seen.insert(t.playlist_name.clone()) {
+                names.push(t.playlist_name.clone());
+            }
+        }
+        names
+    };
 
     // Build initial status response
     let statuses: Vec<(CsvTrackEntry, CsvTrackStatus)> = req
@@ -175,6 +207,9 @@ pub async fn import_csv_batch(
         .iter()
         .map(|t| (t.clone(), CsvTrackStatus::Pending))
         .collect();
+
+    // Clone playlist_names for the return value (original moves into spawned task)
+    let return_playlists = playlist_names.clone();
 
     // Spawn background task for the entire batch
     tokio::spawn(async move {
@@ -479,6 +514,183 @@ pub async fn import_csv_batch(
             task_username,
             tracks.len()
         );
+
+        // --- Playlist creation phase ---
+        // After all downloads are queued, wait for Navidrome to scan, then create playlists
+        if !playlist_names.is_empty() {
+            info!(
+                "Starting playlist creation phase: {} playlists to create",
+                playlist_names.len()
+            );
+
+            // Wait for downloads to settle and beets to import before searching Navidrome.
+            // DownloadMonitor handles beets import + Navidrome scan, but we need to give
+            // it time to finish. We wait a generous amount since tracks process in parallel.
+            let wait_secs = 30 + (tracks.len() as u64 * 5);
+            let wait_secs = wait_secs.min(600); // cap at 10 minutes
+            info!(
+                "Waiting {}s for downloads + beets import to settle before playlist creation",
+                wait_secs
+            );
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+
+            // Trigger a Navidrome library scan and wait for it to complete
+            match navidrome_client_for_user(&user_id).await {
+                Ok(client) => {
+                    if let Err(e) = client.start_scan().await {
+                        warn!("Failed to trigger Navidrome scan: {}", e);
+                    } else {
+                        // Poll scan status until complete (max 2 minutes)
+                        let scan_deadline =
+                            tokio::time::Instant::now() + Duration::from_secs(120);
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            match client.get_scan_status().await {
+                                Ok(true) if tokio::time::Instant::now() < scan_deadline => {
+                                    continue;
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+
+                    // Fetch existing playlists to avoid duplicates
+                    let existing_playlists = client.get_playlists().await.unwrap_or_default();
+
+                    // Build playlist → tracks mapping
+                    let mut playlist_tracks: std::collections::HashMap<String, Vec<&CsvTrackEntry>> =
+                        std::collections::HashMap::new();
+                    for track in &tracks {
+                        if !track.playlist_name.is_empty() {
+                            playlist_tracks
+                                .entry(track.playlist_name.clone())
+                                .or_default()
+                                .push(track);
+                        }
+                    }
+
+                    for (playlist_name, csv_tracks) in &playlist_tracks {
+                        info!(
+                            "Creating playlist '{}' with {} tracks",
+                            playlist_name,
+                            csv_tracks.len()
+                        );
+
+                        // Search Navidrome for each track's song ID
+                        let mut song_ids: Vec<String> = Vec::new();
+                        for csv_track in csv_tracks {
+                            // Search by "artist title" to get best match
+                            let query =
+                                format!("{} {}", csv_track.artist, csv_track.track_name);
+                            match client.search(&query).await {
+                                Ok(results) => {
+                                    // Find best matching song by comparing title + artist
+                                    let title_lower = csv_track.track_name.to_lowercase();
+                                    let artist_lower = csv_track.artist.to_lowercase();
+                                    if let Some(song) = results.song.iter().find(|s| {
+                                        s.title.to_lowercase().contains(&title_lower)
+                                            || title_lower.contains(&s.title.to_lowercase())
+                                    }).or_else(|| {
+                                        // Fallback: match by artist if title didn't match
+                                        results.song.iter().find(|s| {
+                                            s.artist
+                                                .as_deref()
+                                                .map(|a| a.to_lowercase().contains(&artist_lower))
+                                                .unwrap_or(false)
+                                        })
+                                    }).or_else(|| {
+                                        // Last resort: take the first result
+                                        results.song.first()
+                                    }) {
+                                        song_ids.push(song.id.clone());
+                                    } else {
+                                        warn!(
+                                            "No Navidrome match for '{}' by '{}' in playlist '{}'",
+                                            csv_track.track_name,
+                                            csv_track.artist,
+                                            playlist_name
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Navidrome search failed for '{}': {}",
+                                        csv_track.track_name, e
+                                    );
+                                }
+                            }
+                            // Small delay between searches
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+
+                        if song_ids.is_empty() {
+                            warn!(
+                                "No songs found in Navidrome for playlist '{}', skipping",
+                                playlist_name
+                            );
+                            continue;
+                        }
+
+                        // Check if playlist already exists
+                        let existing = existing_playlists
+                            .iter()
+                            .find(|p| p.name.eq_ignore_ascii_case(playlist_name));
+
+                        if let Some(existing_pl) = existing {
+                            // Add songs to existing playlist
+                            match client
+                                .update_playlist_songs(&existing_pl.id, &song_ids)
+                                .await
+                            {
+                                Ok(()) => {
+                                    info!(
+                                        "Updated existing playlist '{}' with {} songs",
+                                        playlist_name,
+                                        song_ids.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to update playlist '{}': {}",
+                                        playlist_name, e
+                                    );
+                                }
+                            }
+                        } else {
+                            // Create new playlist
+                            match client
+                                .create_playlist(playlist_name, &song_ids)
+                                .await
+                            {
+                                Ok(pl) => {
+                                    info!(
+                                        "Created playlist '{}' (id: {}) with {} songs",
+                                        playlist_name,
+                                        pl.id,
+                                        song_ids.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to create playlist '{}': {}",
+                                        playlist_name, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    info!("Playlist creation phase complete");
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not get Navidrome client for playlist creation: {}. \
+                         Playlists will need to be created manually.",
+                        e
+                    );
+                }
+            }
+        }
     });
 
     // Return immediately — downloads happen in background
@@ -488,6 +700,7 @@ pub async fn import_csv_batch(
         failed: 0,
         current_track: None,
         statuses,
+        playlists: return_playlists,
         done: false,
     })
 }
