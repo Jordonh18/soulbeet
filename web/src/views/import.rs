@@ -23,9 +23,30 @@ pub fn ImportPage() -> Element {
     let csv_content = use_signal(|| String::new());
     let folder_id = use_signal(|| String::new());
     let folder_path = use_signal(|| String::new());
+    // Trigger signal: when PreviewSection sets this, we start the import
+    // from the parent scope (so the task survives PreviewSection unmounting).
+    let import_trigger: Signal<Option<CsvBatchImportRequest>> = use_signal(|| None);
 
     // Load user folders for the target folder picker
     let folders_resource = use_resource(|| async { api::get_user_folders().await });
+
+    // Watch import_trigger — run the import in the parent scope so the spawned
+    // task is NOT cancelled when PreviewSection unmounts.
+    use_effect(move || {
+        if let Some(req) = import_trigger() {
+            state.set(ImportState::Importing);
+            spawn(async move {
+                match api::import_csv_batch(req).await {
+                    Ok(progress) => {
+                        state.set(ImportState::Done(progress));
+                    }
+                    Err(e) => {
+                        state.set(ImportState::Error(format!("Import failed: {}", e)));
+                    }
+                }
+            });
+        }
+    });
 
     rsx! {
         div { class: "fixed top-1/4 -left-10 w-64 h-64 bg-purple-500/10 rounded-full blur-[100px] pointer-events-none" }
@@ -57,6 +78,7 @@ pub fn ImportPage() -> Element {
                         state,
                         folder_id: folder_id(),
                         folder_path: folder_path(),
+                        import_trigger,
                     }
                 },
                 ImportState::Importing => rsx! {
@@ -273,6 +295,7 @@ fn PreviewSection(
     state: Signal<ImportState>,
     folder_id: String,
     folder_path: String,
+    import_trigger: Signal<Option<CsvBatchImportRequest>>,
 ) -> Element {
     let track_count = parse_result.tracks.len();
     let tracks_for_import = use_signal(|| parse_result.tracks.clone());
@@ -281,23 +304,13 @@ fn PreviewSection(
         let tracks = tracks_for_import();
         let fid = folder_id.clone();
         let fpath = folder_path.clone();
-        state.set(ImportState::Importing);
-        spawn(async move {
-            match api::import_csv_batch(CsvBatchImportRequest {
-                tracks,
-                folder_id: fid,
-                folder_path: fpath,
-            })
-            .await
-            {
-                Ok(progress) => {
-                    state.set(ImportState::Done(progress));
-                }
-                Err(e) => {
-                    state.set(ImportState::Error(format!("Import failed: {}", e)));
-                }
-            }
-        });
+        // Set the trigger signal — the parent ImportPage picks this up via use_effect
+        // and spawns the import task in its own scope (survives PreviewSection unmount).
+        import_trigger.set(Some(CsvBatchImportRequest {
+            tracks,
+            folder_id: fid,
+            folder_path: fpath,
+        }));
     };
 
     rsx! {
